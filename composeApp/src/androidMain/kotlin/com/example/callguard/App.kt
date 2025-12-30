@@ -3,6 +3,7 @@ package com.example.callguard
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -22,21 +23,34 @@ import java.util.*
 
 // ============ МОДЕЛИ ДАННЫХ ============
 
-enum class AnalysisMode(val displayName: String) {
-    SMART("Умный"),
-    AGGRESSIVE("Агрессивный"),
-    PERMISSIVE("Разрешающий")
+enum class AnalysisMode(val displayName: String, val description: String) {
+    SMART("Умный", "Баланс между защитой и удобством"),
+    AGGRESSIVE("Агрессивный", "Блокирует все подозрительное"),
+    PERMISSIVE("Разрешающий", "Блокирует только явные угрозы")
 }
 
 enum class ThreatType(val displayName: String) {
     SPAM("Спам"),
     FRAUD("Мошенничество"),
     SUSPICIOUS_PATTERN("Подозрительный паттерн"),
-    BLACKLIST("Черный список")
+    BLACKLIST("Черный список"),
+    INTERNATIONAL("Международный спам"),
+    ANONYMOUS("Анонимный вызов")
 }
 
 enum class CallStatus {
     BLOCKED, ALLOWED, MISSED
+}
+
+enum class BlockReason(val displayName: String, val description: String) {
+    REPEATING_DIGITS("Повторяющиеся цифры", "Номер состоит из одинаковых цифр"),
+    SHORT_NUMBER("Короткий номер", "Менее 7 цифр"),
+    SUSPICIOUS_PATTERN("Подозрительный паттерн", "Содержит 0000, 1111, 999"),
+    KNOWN_SPAM("Известный спам", "В черном списке"),
+    PRIVATE_NUMBER("Скрытый номер", "Скрытый или анонимный"),
+    INTERNATIONAL_SCAM("Международный спам", "Подозрительный международный номер"),
+    SEQUENTIAL_NUMBER("Последовательность", "Цифры по порядку или в обратном"),
+    MASS_DIALING("Массовая рассылка", "Номер для массовых звонков")
 }
 
 data class ThreatAlert(
@@ -44,7 +58,8 @@ data class ThreatAlert(
     val phoneNumber: String,
     val threatType: ThreatType,
     val timestamp: Long,
-    val confidence: Int
+    val confidence: Int,
+    val blockReason: BlockReason
 )
 
 data class CallRecord(
@@ -53,102 +68,214 @@ data class CallRecord(
     val contactName: String?,
     val time: String,
     val duration: String,
-    val status: CallStatus
+    val status: CallStatus,
+    val blockReason: BlockReason?
 )
 
 data class TestResult(
+    val id: Long,
     val phoneNumber: String,
+    val description: String,
     val expectedAction: String,
     val actualAction: String,
     val timestamp: Long,
-    val success: Boolean
+    val success: Boolean,
+    val details: String,
+    val blockReason: BlockReason?,
+    val category: String
 )
 
 data class TestScenario(
+    val id: Int,
     val phoneNumber: String,
     val description: String,
-    val isThreat: Boolean
+    val category: String,
+    val expectedAction: String,
+    val blockReason: BlockReason?,
+    val details: String,
+    val difficulty: Int // 1-легкий, 2-средний, 3-сложный
 )
 
-// ============ УТИЛИТЫ ДЛЯ ФОРМАТИРОВАНИЯ ============
+// ============ УТИЛИТЫ ============
 
 private fun formatTimestamp(timestamp: Long): String {
     val date = Date(timestamp)
-    val formatter = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
+    val formatter = SimpleDateFormat("dd.MM.yy HH:mm", Locale.getDefault())
     return formatter.format(date)
 }
 
-// ============ ФУНКЦИИ АНАЛИЗА ЗВОНКОВ ============
+private fun formatTimeShort(timestamp: Long): String {
+    val date = Date(timestamp)
+    val formatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    return formatter.format(date)
+}
 
-private fun analyzeCallForThreats(phoneNumber: String, mode: AnalysisMode): Boolean {
+// ============ ФУНКЦИИ АНАЛИЗА ============
+
+private fun analyzeCallForThreats(phoneNumber: String, mode: AnalysisMode): Pair<Boolean, BlockReason?> {
     return when (mode) {
-        AnalysisMode.SMART -> shouldBlockNumber(phoneNumber)
-        AnalysisMode.AGGRESSIVE -> shouldBlockNumber(phoneNumber) || isSuspiciousNumber(phoneNumber)
-        AnalysisMode.PERMISSIVE -> shouldBlockNumber(phoneNumber) && isHighConfidenceThreat(phoneNumber)
+        AnalysisMode.SMART -> analyzeSmartMode(phoneNumber)
+        AnalysisMode.AGGRESSIVE -> analyzeAggressiveMode(phoneNumber)
+        AnalysisMode.PERMISSIVE -> analyzePermissiveMode(phoneNumber)
     }
 }
 
-private fun shouldBlockNumber(phoneNumber: String): Boolean {
+private fun analyzeSmartMode(phoneNumber: String): Pair<Boolean, BlockReason?> {
     val digits = phoneNumber.filter { it.isDigit() }
 
     return when {
-        // Повторяющиеся цифры
-        digits.matches(Regex("(\\d)\\1{6,}")) -> true
+        digits.matches(Regex("(\\d)\\1{6,}")) ->
+            true to BlockReason.REPEATING_DIGITS
 
-        // Слишком короткий номер
-        digits.length < 7 -> true
+        digits.length < 7 ->
+            true to BlockReason.SHORT_NUMBER
 
-        // Подозрительные паттерны
-        phoneNumber.contains("0000") -> true
-        phoneNumber.contains("1111") -> true
-        phoneNumber.contains("999") -> true
+        phoneNumber.contains("0000") || phoneNumber.contains("1111") || phoneNumber.contains("999") ->
+            true to BlockReason.SUSPICIOUS_PATTERN
 
-        // Известные спам-номера
-        phoneNumber in knownSpamNumbers() -> true
+        phoneNumber in getKnownSpamNumbers() ->
+            true to BlockReason.KNOWN_SPAM
 
-        else -> false
+        phoneNumber == "unknown" || phoneNumber == "private" || phoneNumber.contains("#31#") ->
+            true to BlockReason.PRIVATE_NUMBER
+
+        phoneNumber.startsWith("+1") && phoneNumber.contains("555") ->
+            true to BlockReason.INTERNATIONAL_SCAM
+
+        else -> false to null
     }
 }
 
-private fun isSuspiciousNumber(phoneNumber: String): Boolean {
+private fun analyzeAggressiveMode(phoneNumber: String): Pair<Boolean, BlockReason?> {
+    val (shouldBlock, reason) = analyzeSmartMode(phoneNumber)
+
+    if (shouldBlock) return true to reason
+
     val digits = phoneNumber.filter { it.isDigit() }
-    return digits.length == 11 && digits.startsWith("7") && digits[1] in "9".toList()
-}
 
-private fun isHighConfidenceThreat(phoneNumber: String): Boolean {
-    return phoneNumber in highConfidenceThreats()
-}
-
-private fun detectThreatType(phoneNumber: String): ThreatType {
     return when {
-        phoneNumber in knownSpamNumbers() -> ThreatType.SPAM
-        phoneNumber.contains("0000") || phoneNumber.contains("1111") -> ThreatType.SUSPICIOUS_PATTERN
-        phoneNumber.filter { it.isDigit() }.length < 7 -> ThreatType.FRAUD
-        else -> ThreatType.BLACKLIST
+        isSequentialNumber(digits) ->
+            true to BlockReason.SEQUENTIAL_NUMBER
+
+        phoneNumber.startsWith("+7900") ->
+            true to BlockReason.MASS_DIALING
+
+        phoneNumber.startsWith("+") && !phoneNumber.startsWith("+7") && !phoneNumber.startsWith("+1") ->
+            true to BlockReason.INTERNATIONAL_SCAM
+
+        digits.matches(Regex("(\\d{2})\\1{3,}")) ->
+            true to BlockReason.SUSPICIOUS_PATTERN
+
+        else -> false to null
     }
 }
 
-private fun knownSpamNumbers(): List<String> = listOf(
-    "+79991111111",
-    "+79031112233",
-    "+79051111111",
-    "+79998887766"
+private fun analyzePermissiveMode(phoneNumber: String): Pair<Boolean, BlockReason?> {
+    val digits = phoneNumber.filter { it.isDigit() }
+
+    return when {
+        phoneNumber in getHighRiskSpamNumbers() ->
+            true to BlockReason.KNOWN_SPAM
+
+        digits.matches(Regex("(\\d)\\1{8,}")) ->
+            true to BlockReason.REPEATING_DIGITS
+
+        digits.length < 5 ->
+            true to BlockReason.SHORT_NUMBER
+
+        else -> false to null
+    }
+}
+
+private fun isSequentialNumber(digits: String): Boolean {
+    if (digits.length < 7) return false
+
+    var isAscending = true
+    for (i in 1 until digits.length) {
+        if (digits[i].digitToInt() != digits[i-1].digitToInt() + 1) {
+            isAscending = false
+            break
+        }
+    }
+
+    var isDescending = true
+    for (i in 1 until digits.length) {
+        if (digits[i].digitToInt() != digits[i-1].digitToInt() - 1) {
+            isDescending = false
+            break
+        }
+    }
+
+    return isAscending || isDescending
+}
+
+private fun getKnownSpamNumbers(): List<String> = listOf(
+    "+79991111111", "+79031112233", "+79051111111", "+79998887766",
+    "+74951230000", "+79001234567", "+79069876543", "+79025556677",
+    "+79034445566", "+79017778899"
 )
 
-private fun highConfidenceThreats(): List<String> = listOf(
-    "+79991111111",
-    "+712345"
+private fun getHighRiskSpamNumbers(): List<String> = listOf(
+    "+79991111111", "+712345", "+79031112233"
 )
 
-// ============ ФУНКЦИИ ДЛЯ ПРИМЕРНЫХ ДАННЫХ ============
+private fun detectThreatType(blockReason: BlockReason?): ThreatType {
+    return when (blockReason) {
+        BlockReason.REPEATING_DIGITS, BlockReason.SEQUENTIAL_NUMBER -> ThreatType.SUSPICIOUS_PATTERN
+        BlockReason.SHORT_NUMBER -> ThreatType.FRAUD
+        BlockReason.KNOWN_SPAM, BlockReason.MASS_DIALING -> ThreatType.BLACKLIST
+        BlockReason.PRIVATE_NUMBER -> ThreatType.ANONYMOUS
+        BlockReason.INTERNATIONAL_SCAM -> ThreatType.INTERNATIONAL
+        BlockReason.SUSPICIOUS_PATTERN -> ThreatType.SPAM
+        null -> ThreatType.SPAM
+    }
+}
+
+// ============ ТЕСТОВЫЕ СЦЕНАРИИ ============
+
+private fun getTestScenarios(): List<TestScenario> = listOf(
+    TestScenario(1, "+79161234567", "Личный номер", "Нормальный", "Разрешить", null, "Нормальный российский номер", 1),
+    TestScenario(2, "+74957775533", "Московский номер", "Нормальный", "Разрешить", null, "Городской номер Москвы", 1),
+    TestScenario(3, "+78002000600", "Служба поддержки", "Нормальный", "Разрешить", null, "Бесплатный номер", 1),
+    TestScenario(4, "+74952123456", "Бизнес номер", "Нормальный", "Разрешить", null, "Корпоративный номер", 1),
+
+    TestScenario(5, "+79991111111", "Повторяющиеся 1", "Очевидный спам", "Блокировка", BlockReason.REPEATING_DIGITS, "7 повторяющихся единиц", 1),
+    TestScenario(6, "+72222222222", "Повторяющиеся 2", "Очевидный спам", "Блокировка", BlockReason.REPEATING_DIGITS, "Повторяющиеся двойки", 1),
+    TestScenario(7, "+712345", "Короткий номер", "Очевидный спам", "Блокировка", BlockReason.SHORT_NUMBER, "Всего 6 цифр", 1),
+    TestScenario(8, "+74951230000", "Нулевой паттерн", "Очевидный спам", "Блокировка", BlockReason.SUSPICIOUS_PATTERN, "Известный спам-номер", 1),
+
+    TestScenario(9, "+74950000000", "Много нулей", "Подозрительный", "Блокировка", BlockReason.SUSPICIOUS_PATTERN, "Паттерн 0000", 2),
+    TestScenario(10, "+79161111111", "Много единиц", "Подозрительный", "Блокировка", BlockReason.SUSPICIOUS_PATTERN, "Паттерн 1111", 2),
+    TestScenario(11, "+79039999999", "Много девяток", "Подозрительный", "Блокировка", BlockReason.SUSPICIOUS_PATTERN, "Паттерн 999", 2),
+    TestScenario(12, "+79034445566", "Повтор пар", "Подозрительный", "Блокировка", BlockReason.SUSPICIOUS_PATTERN, "Повторяющиеся пары цифр", 2),
+
+    TestScenario(13, "+79031112233", "Из черного списка", "Известный спам", "Блокировка", BlockReason.KNOWN_SPAM, "Номер в черном списке", 2),
+    TestScenario(14, "+79051111111", "Спам-рассылка", "Известный спам", "Блокировка", BlockReason.KNOWN_SPAM, "Массовая рассылка", 2),
+    TestScenario(15, "+79025556677", "Рекламный номер", "Известный спам", "Блокировка", BlockReason.KNOWN_SPAM, "Рекламные звонки", 2),
+
+    TestScenario(16, "unknown", "Скрытый номер", "Анонимный", "Блокировка", BlockReason.PRIVATE_NUMBER, "Скрытый номер", 3),
+    TestScenario(17, "#31#+79161234567", "Скрытый вызов", "Анонимный", "Блокировка", BlockReason.PRIVATE_NUMBER, "С вызовом через #31#", 3),
+
+    TestScenario(18, "+15551234567", "Американский", "Международный", "Разрешить", null, "Номер из США", 2),
+    TestScenario(19, "+15555555555", "Подозрительный US", "Международный", "Блокировка", BlockReason.INTERNATIONAL_SCAM, "Подозрительный американский", 2),
+    TestScenario(20, "+441234567890", "Великобритания", "Международный", "Разрешить", null, "Номер из UK", 2),
+
+    TestScenario(21, "+79161234567", "Последовательность", "Паттерн", "Блокировка", BlockReason.SEQUENTIAL_NUMBER, "Цифры по порядку 1234567", 3),
+    TestScenario(22, "+79169876543", "Обратная посл.", "Паттерн", "Блокировка", BlockReason.SEQUENTIAL_NUMBER, "Цифры в обратном порядке", 3),
+
+    TestScenario(23, "+79001234567", "Массовая рассылка", "Массовый спам", "Блокировка", BlockReason.MASS_DIALING, "Диапазон для рассылок", 2),
+    TestScenario(24, "+79017778899", "Call-центр", "Массовый спам", "Блокировка", BlockReason.MASS_DIALING, "Номер call-центра", 2)
+)
+
+// ============ ОБРАЗЦЫ ДАННЫХ ============
 
 private fun getSampleCallRecords(): List<CallRecord> = listOf(
-    CallRecord(1, "+79161234567", "Иван Петров", "10:25", "2:15", CallStatus.ALLOWED),
-    CallRecord(2, "+79991111111", null, "09:42", "0:00", CallStatus.BLOCKED),
-    CallRecord(3, "+74951234567", "Офис", "09:15", "1:30", CallStatus.ALLOWED),
-    CallRecord(4, "+712345", null, "08:55", "0:00", CallStatus.BLOCKED),
-    CallRecord(5, "+74950000000", null, "08:30", "0:00", CallStatus.BLOCKED),
-    CallRecord(6, "+79167654321", "Мария", "08:05", "5:20", CallStatus.ALLOWED)
+    CallRecord(1, "+79161234567", "Иван Петров", "10:25", "2:15", CallStatus.ALLOWED, null),
+    CallRecord(2, "+79991111111", null, "09:42", "0:00", CallStatus.BLOCKED, BlockReason.REPEATING_DIGITS),
+    CallRecord(3, "+74951234567", "Офис", "09:15", "1:30", CallStatus.ALLOWED, null),
+    CallRecord(4, "+712345", null, "08:55", "0:00", CallStatus.BLOCKED, BlockReason.SHORT_NUMBER),
+    CallRecord(5, "+74950000000", null, "08:30", "0:00", CallStatus.BLOCKED, BlockReason.SUSPICIOUS_PATTERN),
+    CallRecord(6, "+79167654321", "Мария", "08:05", "5:20", CallStatus.ALLOWED, null)
 )
 
 private fun getSampleThreats(): List<ThreatAlert> {
@@ -163,15 +290,15 @@ private fun getSampleThreats(): List<ThreatAlert> {
     val oneDayAgo = calendar.timeInMillis
 
     return listOf(
-        ThreatAlert(1, "+79991111111", ThreatType.SPAM, twoHoursAgo, 95),
-        ThreatAlert(2, "+712345", ThreatType.FRAUD, fourHoursAgo, 88),
-        ThreatAlert(3, "+74950000000", ThreatType.SUSPICIOUS_PATTERN, oneDayAgo, 92)
+        ThreatAlert(1, "+79991111111", ThreatType.SUSPICIOUS_PATTERN, twoHoursAgo, 95, BlockReason.REPEATING_DIGITS),
+        ThreatAlert(2, "+712345", ThreatType.FRAUD, fourHoursAgo, 88, BlockReason.SHORT_NUMBER),
+        ThreatAlert(3, "+74950000000", ThreatType.SPAM, oneDayAgo, 92, BlockReason.SUSPICIOUS_PATTERN)
     )
 }
 
 private fun getUpdatedCallRecords(): List<CallRecord> = getSampleCallRecords() + listOf(
-    CallRecord(7, "+79031112233", null, "11:10", "0:00", CallStatus.BLOCKED),
-    CallRecord(8, "+79169998877", "Коллега", "11:05", "3:45", CallStatus.ALLOWED)
+    CallRecord(7, "+79031112233", null, "11:10", "0:00", CallStatus.BLOCKED, BlockReason.KNOWN_SPAM),
+    CallRecord(8, "+79169998877", "Коллега", "11:05", "3:45", CallStatus.ALLOWED, null)
 )
 
 private fun getInitialTestResults(): List<TestResult> = emptyList()
@@ -189,23 +316,30 @@ fun App() {
     var isLoading by remember { mutableStateOf(false) }
     var showTestPanel by remember { mutableStateOf(false) }
     var testResults by remember { mutableStateOf(listOf<TestResult>()) }
+    var selectedTestCategory by remember { mutableStateOf("Все") }
 
     val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
         recentCalls = getSampleCallRecords()
         threatsDetected = getSampleThreats()
-        testResults = getInitialTestResults()
     }
 
-    fun simulateCall(phoneNumber: String, contactName: String? = null) {
+    val testCategories = listOf("Все", "Нормальный", "Очевидный спам", "Подозрительный",
+        "Известный спам", "Анонимный", "Международный", "Паттерн", "Массовый спам")
+
+    val filteredScenarios = if (selectedTestCategory == "Все") {
+        getTestScenarios()
+    } else {
+        getTestScenarios().filter { it.category == selectedTestCategory }
+    }
+
+    fun simulateCall(scenario: TestScenario) {
         coroutineScope.launch {
             isLoading = true
+            delay(300)
 
-            // Имитация анализа звонка
-            delay(500)
-
-            val isThreat = analyzeCallForThreats(phoneNumber, analysisMode)
+            val (isThreat, blockReason) = analyzeCallForThreats(scenario.phoneNumber, analysisMode)
             val status = if (isThreat && isProtectionActive) {
                 CallStatus.BLOCKED
             } else {
@@ -214,40 +348,72 @@ fun App() {
 
             val callRecord = CallRecord(
                 id = System.currentTimeMillis(),
-                phoneNumber = phoneNumber,
-                contactName = contactName,
+                phoneNumber = scenario.phoneNumber,
+                contactName = scenario.description,
                 time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date()),
-                duration = if (status == CallStatus.BLOCKED) "0:00" else "${(1..5).random()}:${(10..59).random()}",
-                status = status
+                duration = if (status == CallStatus.BLOCKED) "0:00" else "${(1..3).random()}:${(10..45).random()}",
+                status = status,
+                blockReason = blockReason
             )
 
             recentCalls = listOf(callRecord) + recentCalls.take(9)
 
-            if (isThreat && isProtectionActive) {
+            if (isThreat && isProtectionActive && blockReason != null) {
                 blockedCallsCount++
 
                 val threatAlert = ThreatAlert(
                     id = System.currentTimeMillis(),
-                    phoneNumber = phoneNumber,
-                    threatType = detectThreatType(phoneNumber),
+                    phoneNumber = scenario.phoneNumber,
+                    threatType = detectThreatType(blockReason),
                     timestamp = System.currentTimeMillis(),
-                    confidence = (80..99).random()
+                    confidence = (85..99).random(),
+                    blockReason = blockReason
                 )
 
                 threatsDetected = listOf(threatAlert) + threatsDetected.take(4)
             }
 
-            // Добавляем результат теста
+            val success = when {
+                !isProtectionActive -> status == CallStatus.ALLOWED
+                else -> {
+                    when {
+                        scenario.blockReason != null -> isThreat && status == CallStatus.BLOCKED
+                        else -> !isThreat && status == CallStatus.ALLOWED
+                    }
+                }
+            }
+
             val testResult = TestResult(
-                phoneNumber = phoneNumber,
-                expectedAction = if (shouldBlockNumber(phoneNumber)) "Блокировка" else "Разрешить",
+                id = System.currentTimeMillis(),
+                phoneNumber = scenario.phoneNumber,
+                description = scenario.description,
+                expectedAction = if (scenario.blockReason != null) "Блокировка" else "Разрешить",
                 actualAction = if (status == CallStatus.BLOCKED) "Заблокирован" else "Разрешён",
                 timestamp = System.currentTimeMillis(),
-                success = (isThreat && status == CallStatus.BLOCKED) || (!isThreat && status == CallStatus.ALLOWED)
+                success = success,
+                details = scenario.details,
+                blockReason = blockReason,
+                category = scenario.category
             )
 
-            testResults = listOf(testResult) + testResults.take(9)
+            testResults = listOf(testResult) + testResults.take(14)
+            isLoading = false
+        }
+    }
 
+    fun runCategoryTest(category: String) {
+        coroutineScope.launch {
+            isLoading = true
+            val scenarios = getTestScenarios().filter { it.category == category }
+
+            for ((index, scenario) in scenarios.withIndex()) {
+                delay(400)
+                simulateCall(scenario)
+
+                if (index < scenarios.size - 1) {
+                    delay(200)
+                }
+            }
             isLoading = false
         }
     }
@@ -255,30 +421,34 @@ fun App() {
     fun runComprehensiveTest() {
         coroutineScope.launch {
             isLoading = true
-
-            // Тестовые сценарии
-            val testScenarios = listOf(
-                TestScenario("+79161234567", "Нормальный номер", false),
-                TestScenario("+79991111111", "Спам-номер (1111111)", true),
-                TestScenario("+712345", "Короткий номер", true),
-                TestScenario("+74950000000", "Паттерн 0000", true),
-                TestScenario("+79031234567", "Неизвестный номер", false),
-                TestScenario("+74951234567", "Телефон банка", false),
-                TestScenario("+79998887766", "Подозрительный номер", true)
-            )
-
             testResults = emptyList()
+            val scenarios = getTestScenarios()
 
-            for ((index, scenario) in testScenarios.withIndex()) {
-                delay(800)
+            for ((index, scenario) in scenarios.withIndex()) {
+                delay(350)
+                simulateCall(scenario)
 
-                simulateCall(scenario.phoneNumber, scenario.description)
-
-                if (index < testScenarios.size - 1) {
-                    delay(300)
+                if (index < scenarios.size - 1) {
+                    delay(150)
                 }
             }
+            isLoading = false
+        }
+    }
 
+    fun runDifficultyTest(difficulty: Int) {
+        coroutineScope.launch {
+            isLoading = true
+            val scenarios = getTestScenarios().filter { it.difficulty == difficulty }
+
+            for ((index, scenario) in scenarios.withIndex()) {
+                delay(500)
+                simulateCall(scenario)
+
+                if (index < scenarios.size - 1) {
+                    delay(250)
+                }
+            }
             isLoading = false
         }
     }
@@ -291,7 +461,21 @@ fun App() {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text("🛡️", style = MaterialTheme.typography.titleLarge)
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.primary),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                "CG",
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            )
+                        }
                         Text(
                             "CallGuard Pro",
                             style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
@@ -302,9 +486,11 @@ fun App() {
                     containerColor = MaterialTheme.colorScheme.surfaceColorAtElevation(3.dp)
                 ),
                 actions = {
-                    // Кнопка тестовой панели
                     IconButton(onClick = { showTestPanel = !showTestPanel }) {
-                        Text(if (showTestPanel) "📋" else "🧪", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            if (showTestPanel) "Главная" else "Тесты",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium)
+                        )
                     }
                     IconButton(onClick = {
                         coroutineScope.launch {
@@ -314,7 +500,7 @@ fun App() {
                             isLoading = false
                         }
                     }) {
-                        Text("🔄", style = MaterialTheme.typography.bodyLarge)
+                        Text("Обновить", style = MaterialTheme.typography.labelMedium)
                     }
                 }
             )
@@ -322,28 +508,30 @@ fun App() {
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(
-                    selected = true,
-                    onClick = { },
-                    icon = { Text("🏠") },
+                    selected = !showTestPanel,
+                    onClick = { showTestPanel = false },
+                    icon = {
+                        Box(
+                            modifier = Modifier.size(24.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("🏠")
+                        }
+                    },
                     label = { Text("Главная") }
                 )
                 NavigationBarItem(
-                    selected = false,
-                    onClick = { },
-                    icon = { Text("📊") },
-                    label = { Text("Аналитика") }
-                )
-                NavigationBarItem(
-                    selected = false,
-                    onClick = { },
-                    icon = { Text("📋") },
-                    label = { Text("История") }
-                )
-                NavigationBarItem(
-                    selected = false,
-                    onClick = { },
-                    icon = { Text("👤") },
-                    label = { Text("Профиль") }
+                    selected = showTestPanel,
+                    onClick = { showTestPanel = true },
+                    icon = {
+                        Box(
+                            modifier = Modifier.size(24.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("🧪")
+                        }
+                    },
+                    label = { Text("Тесты") }
                 )
             }
         }
@@ -363,6 +551,23 @@ fun App() {
                     Text("Анализ вызова...", style = MaterialTheme.typography.bodyMedium)
                 }
             }
+        } else if (showTestPanel) {
+            AdvancedTestPanel(
+                isProtectionActive = isProtectionActive,
+                analysisMode = analysisMode,
+                selectedCategory = selectedTestCategory,
+                categories = testCategories,
+                onCategorySelected = { selectedTestCategory = it },
+                onRunSingleTest = { scenario -> simulateCall(scenario) },
+                onRunCategoryTest = { category -> runCategoryTest(category) },
+                onRunComprehensiveTest = { runComprehensiveTest() },
+                onRunDifficultyTest = { difficulty -> runDifficultyTest(difficulty) },
+                testResults = testResults,
+                testScenarios = filteredScenarios,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(paddingValues)
+            )
         } else {
             LazyColumn(
                 modifier = Modifier
@@ -372,20 +577,6 @@ fun App() {
                 verticalArrangement = Arrangement.spacedBy(16.dp),
                 contentPadding = PaddingValues(16.dp)
             ) {
-                // Тестовая панель (если включена)
-                if (showTestPanel) {
-                    item {
-                        TestPanelSection(
-                            isProtectionActive = isProtectionActive,
-                            onRunSingleTest = { phoneNumber, description ->
-                                simulateCall(phoneNumber, description)
-                            },
-                            onRunComprehensiveTest = { runComprehensiveTest() },
-                            testResults = testResults
-                        )
-                    }
-                }
-
                 item {
                     HeaderSection(isProtectionActive, blockedCallsCount)
                 }
@@ -430,119 +621,38 @@ fun App() {
     }
 }
 
-// ============ КОМПОНЕНТЫ ИНТЕРФЕЙСА ============
+// ============ РАСШИРЕННАЯ ТЕСТОВАЯ ПАНЕЛЬ ============
 
 @Composable
-fun TestPanelSection(
+fun AdvancedTestPanel(
     isProtectionActive: Boolean,
-    onRunSingleTest: (String, String) -> Unit,
+    analysisMode: AnalysisMode,
+    selectedCategory: String,
+    categories: List<String>,
+    onCategorySelected: (String) -> Unit,
+    onRunSingleTest: (TestScenario) -> Unit,
+    onRunCategoryTest: (String) -> Unit,
     onRunComprehensiveTest: () -> Unit,
-    testResults: List<TestResult>
+    onRunDifficultyTest: (Int) -> Unit,
+    testResults: List<TestResult>,
+    testScenarios: List<TestScenario>,
+    modifier: Modifier = Modifier
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    LazyColumn(
+        modifier = modifier.background(MaterialTheme.colorScheme.background),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        contentPadding = PaddingValues(16.dp)
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Row(
+        item {
+            Card(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "🧪 Тестирование системы",
-                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
                 )
-                Badge(
-                    containerColor = if (isProtectionActive)
-                        MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.error
-                ) {
-                    Text(if (isProtectionActive) "ВКЛ" else "ВЫКЛ")
-                }
-            }
-
-            Text(
-                "Протестируйте работу системы с разными типами номеров",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            // Быстрые тесты
-            Column(
-                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text(
-                    "Быстрые тесты:",
-                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium)
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    TestButton(
-                        phoneNumber = "+79161234567",
-                        description = "Нормальный",
-                        expectedResult = "✅",
-                        onClick = onRunSingleTest
-                    )
-
-                    TestButton(
-                        phoneNumber = "+79991111111",
-                        description = "Спам",
-                        expectedResult = "⛔",
-                        onClick = onRunSingleTest
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    TestButton(
-                        phoneNumber = "+712345",
-                        description = "Короткий",
-                        expectedResult = "⛔",
-                        onClick = onRunSingleTest
-                    )
-
-                    TestButton(
-                        phoneNumber = "+74950000000",
-                        description = "Паттерн 0000",
-                        expectedResult = "⛔",
-                        onClick = onRunSingleTest
-                    )
-                }
-
-                // Комплексный тест
-                FilledTonalButton(
-                    onClick = onRunComprehensiveTest,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.filledTonalButtonColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    )
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("🔬")
-                        Text("Запустить комплексный тест", style = MaterialTheme.typography.labelLarge)
-                    }
-                }
-            }
-
-            // Результаты тестов
-            if (testResults.isNotEmpty()) {
                 Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -550,57 +660,306 @@ fun TestPanelSection(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            "Результаты тестов:",
-                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium)
+                            "Лаборатория тестирования",
+                            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
                         )
-                        Text(
-                            "${testResults.count { it.success }}/${testResults.size} успешно",
-                            style = MaterialTheme.typography.labelMedium
-                        )
+                        Badge(
+                            containerColor = if (isProtectionActive)
+                                MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.error
+                        ) {
+                            Text(if (isProtectionActive) "ЗАЩИТА ВКЛ" else "ЗАЩИТА ВЫКЛ")
+                        }
                     }
 
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        modifier = Modifier.height(120.dp)
+                    Text(
+                        "Тестируйте алгоритмы анализа с 24+ сценариями",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        items(testResults.take(5)) { result ->
-                            TestResultItem(result = result)
+                        Column {
+                            Text("Режим:", style = MaterialTheme.typography.labelSmall)
+                            Text(analysisMode.displayName, style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium))
+                        }
+
+                        Spacer(modifier = Modifier.weight(1f))
+
+                        val successRate = if (testResults.isNotEmpty()) {
+                            testResults.count { it.success } * 100 / testResults.size
+                        } else { 0 }
+
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("Успешность:", style = MaterialTheme.typography.labelSmall)
+                            Text("$successRate%", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium))
                         }
                     }
                 }
+            }
+        }
+
+        item {
+            Text(
+                "Категории тестов:",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+            )
+
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                items(categories) { category ->
+                    FilterChip(
+                        selected = category == selectedCategory,
+                        onClick = { onCategorySelected(category) },
+                        label = {
+                            Text(category, style = MaterialTheme.typography.labelMedium)
+                        }
+                    )
+                }
+            }
+        }
+
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Text(
+                        "Быстрые тесты",
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { onRunDifficultyTest(1) },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
+                            )
+                        ) {
+                            Text("Легкие")
+                        }
+
+                        Button(
+                            onClick = { onRunDifficultyTest(2) },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.secondary.copy(alpha = 0.8f)
+                            )
+                        ) {
+                            Text("Средние")
+                        }
+
+                        Button(
+                            onClick = { onRunDifficultyTest(3) },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.8f)
+                            )
+                        ) {
+                            Text("Сложные")
+                        }
+                    }
+
+                    FilledTonalButton(
+                        onClick = onRunComprehensiveTest,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer
+                        )
+                    ) {
+                        Text("Полное тестирование (24 сценария)", style = MaterialTheme.typography.labelLarge)
+                    }
+
+                    if (selectedCategory != "Все") {
+                        OutlinedButton(
+                            onClick = { onRunCategoryTest(selectedCategory) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Тест категории: $selectedCategory", style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            Text(
+                "Сценарии тестирования (${testScenarios.size}):",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+            )
+        }
+
+        items(testScenarios.chunked(2)) { rowScenarios ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                rowScenarios.forEach { scenario ->
+                    Box(modifier = Modifier.weight(1f)) {
+                        TestScenarioCard(
+                            scenario = scenario,
+                            onClick = { onRunSingleTest(scenario) }
+                        )
+                    }
+                }
+
+                if (rowScenarios.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+
+        if (testResults.isNotEmpty()) {
+            item {
+                TestResultsSection(testResults = testResults)
             }
         }
     }
 }
 
 @Composable
-fun TestButton(
-    phoneNumber: String,
-    description: String,
-    expectedResult: String,
-    onClick: (String, String) -> Unit
+fun TestScenarioCard(
+    scenario: TestScenario,
+    onClick: () -> Unit
 ) {
-    OutlinedButton(
-        onClick = { onClick(phoneNumber, description) },
-        modifier = Modifier.fillMaxWidth(), // Убрали weight
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = MaterialTheme.colorScheme.surface
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(
+                            if (scenario.blockReason != null)
+                                MaterialTheme.colorScheme.error.copy(alpha = 0.1f)
+                            else
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+                        )
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        if (scenario.blockReason != null) "БЛОК" else "ОК",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = if (scenario.blockReason != null)
+                            MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    repeat(scenario.difficulty) {
+                        Text("•", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            Text(
+                scenario.phoneNumber.take(12),
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
+            )
+
+            Text(
+                scenario.description,
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Divider(modifier = Modifier.fillMaxWidth(), thickness = 0.5.dp)
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (scenario.blockReason != null) "Блокировка" else "Разрешить",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                    color = if (scenario.blockReason != null)
+                        MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.primary
+                )
+
+                Text(
+                    scenario.category,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun TestResultsSection(testResults: List<TestResult>) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceColorAtElevation(2.dp)
         )
     ) {
         Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(2.dp)
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                phoneNumber.takeLast(7),
-                style = MaterialTheme.typography.labelMedium
-            )
             Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(description)
-                Text(expectedResult)
+                Text(
+                    "Результаты тестов",
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+                )
+
+                val successCount = testResults.count { it.success }
+                val total = testResults.size
+                Badge(
+                    containerColor = if (successCount == total)
+                        MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.secondary
+                ) {
+                    Text("$successCount/$total")
+                }
+            }
+
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.height(200.dp)
+            ) {
+                items(testResults.take(10)) { result ->
+                    TestResultItem(result = result)
+                }
             }
         }
     }
@@ -612,34 +971,85 @@ fun TestResultItem(result: TestResult) {
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
         color = if (result.success)
-            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
-        else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
+            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f)
+        else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.2f)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(8.dp),
+                .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Column {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(
+                        if (result.success)
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+                        else
+                            MaterialTheme.colorScheme.error.copy(alpha = 0.1f)
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
                 Text(
-                    result.phoneNumber,
-                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium)
-                )
-                Text(
-                    "${result.expectedAction} → ${result.actualAction}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    if (result.success) "УСП" else "ОШБ",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = if (result.success)
+                        MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error
                 )
             }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    result.phoneNumber.take(14),
+                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium)
+                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        "Ожидалось: ${result.expectedAction}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text("→", style = MaterialTheme.typography.labelSmall)
+                    Text(
+                        "Факт: ${result.actualAction}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (result.success)
+                            MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.error,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                result.blockReason?.let { reason ->
+                    Text(
+                        "Причина: ${reason.displayName}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+
             Text(
-                if (result.success) "✅" else "❌",
-                style = MaterialTheme.typography.bodyLarge
+                formatTimeShort(result.timestamp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }
 }
+
+// ============ ОСНОВНЫЕ КОМПОНЕНТЫ ИНТЕРФЕЙСА ============
 
 @Composable
 fun HeaderSection(isActive: Boolean, blockedCount: Int) {
@@ -679,7 +1089,7 @@ fun HeaderSection(isActive: Boolean, blockedCount: Int) {
                         )
                     )
                     Text(
-                        if (isActive) "✅ Все системы работают" else "⚠️ Защита отключена",
+                        if (isActive) "Все системы работают" else "Защита отключена",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -705,7 +1115,6 @@ fun HeaderSection(isActive: Boolean, blockedCount: Int) {
             }
         }
 
-        // Статистика в виде простых колонок
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly
@@ -714,9 +1123,8 @@ fun HeaderSection(isActive: Boolean, blockedCount: Int) {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Text("📅", style = MaterialTheme.typography.headlineSmall)
+                Text("СЕГОДНЯ", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
                 Text("12", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold))
-                Text("сегодня", style = MaterialTheme.typography.labelSmall)
                 Text("вызовов", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
@@ -724,9 +1132,8 @@ fun HeaderSection(isActive: Boolean, blockedCount: Int) {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Text("🛡️", style = MaterialTheme.typography.headlineSmall)
+                Text("БЛОКИРОВАНО", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
                 Text("5", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold))
-                Text("блокировано", style = MaterialTheme.typography.labelSmall)
                 Text("угроз", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
@@ -734,9 +1141,8 @@ fun HeaderSection(isActive: Boolean, blockedCount: Int) {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Text("📈", style = MaterialTheme.typography.headlineSmall)
+                Text("ЭФФЕКТИВНОСТЬ", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
                 Text("98%", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold))
-                Text("эффективность", style = MaterialTheme.typography.labelSmall)
                 Text("точность", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
@@ -761,7 +1167,6 @@ fun QuickActionsSection(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Кнопка включения/выключения защиты
             Button(
                 onClick = onToggleProtection,
                 modifier = Modifier.weight(1f),
@@ -771,48 +1176,35 @@ fun QuickActionsSection(
                     else MaterialTheme.colorScheme.error
                 )
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                Column(
+                    horizontalAlignment = Alignment.Start
                 ) {
-                    Text(if (isProtectionActive) "⏹️" else "▶️")
-                    Column(
-                        horizontalAlignment = Alignment.Start
-                    ) {
-                        Text(
-                            if (isProtectionActive) "Выключить" else "Включить",
-                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium)
-                        )
-                        Text(
-                            "Защиту",
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    }
+                    Text(
+                        if (isProtectionActive) "ВЫКЛЮЧИТЬ" else "ВКЛЮЧИТЬ",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium)
+                    )
+                    Text(
+                        "Защиту",
+                        style = MaterialTheme.typography.labelSmall
+                    )
                 }
             }
 
-            // Кнопка тестирования
             OutlinedButton(
                 onClick = onRunScan,
                 modifier = Modifier.weight(1f)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                Column(
+                    horizontalAlignment = Alignment.Start
                 ) {
-                    Text("🧪")
-                    Column(
-                        horizontalAlignment = Alignment.Start
-                    ) {
-                        Text(
-                            "Протестировать",
-                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium)
-                        )
-                        Text(
-                            "систему",
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    }
+                    Text(
+                        "ТЕСТИРОВАТЬ",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium)
+                    )
+                    Text(
+                        "систему",
+                        style = MaterialTheme.typography.labelSmall
+                    )
                 }
             }
         }
@@ -832,47 +1224,83 @@ fun AnalysisModesSection(
             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
         )
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        Column(
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            AnalysisModeChip(
-                mode = AnalysisMode.SMART,
-                isSelected = currentMode == AnalysisMode.SMART,
-                onClick = onModeSelected
-            )
-            AnalysisModeChip(
-                mode = AnalysisMode.AGGRESSIVE,
-                isSelected = currentMode == AnalysisMode.AGGRESSIVE,
-                onClick = onModeSelected
-            )
-            AnalysisModeChip(
-                mode = AnalysisMode.PERMISSIVE,
-                isSelected = currentMode == AnalysisMode.PERMISSIVE,
-                onClick = onModeSelected
-            )
+            AnalysisMode.values().forEach { mode ->
+                AnalysisModeCard(
+                    mode = mode,
+                    isSelected = currentMode == mode,
+                    onClick = { onModeSelected(mode) }
+                )
+            }
         }
     }
 }
 
 @Composable
-fun AnalysisModeChip(
+fun AnalysisModeCard(
     mode: AnalysisMode,
     isSelected: Boolean,
-    onClick: (AnalysisMode) -> Unit
+    onClick: () -> Unit
 ) {
-    FilterChip(
-        selected = isSelected,
-        onClick = { onClick(mode) },
-        label = {
-            Text(mode.displayName, style = MaterialTheme.typography.labelMedium)
-        },
-        leadingIcon = if (isSelected) {
-            {
-                Text("✓", style = MaterialTheme.typography.bodyMedium)
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected)
+                MaterialTheme.colorScheme.primaryContainer
+            else MaterialTheme.colorScheme.surfaceVariant
+        ),
+        border = if (isSelected) CardDefaults.outlinedCardBorder() else null
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(
+                        if (isSelected) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.1f)
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    when (mode) {
+                        AnalysisMode.SMART -> "У"
+                        AnalysisMode.AGGRESSIVE -> "А"
+                        AnalysisMode.PERMISSIVE -> "Р"
+                    },
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                )
             }
-        } else null
-    )
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    mode.displayName,
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold)
+                )
+                Text(
+                    mode.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (isSelected) {
+                Text("✓", style = MaterialTheme.typography.titleMedium)
+            }
+        }
+    }
 }
 
 @Composable
@@ -932,13 +1360,9 @@ fun ThreatItem(threat: ThreatAlert) {
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    when (threat.threatType) {
-                        ThreatType.SPAM -> "⚠️"
-                        ThreatType.FRAUD -> "🚫"
-                        ThreatType.SUSPICIOUS_PATTERN -> "🔍"
-                        ThreatType.BLACKLIST -> "⛔"
-                    },
-                    style = MaterialTheme.typography.bodyLarge
+                    "УГР",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.error
                 )
             }
 
@@ -951,7 +1375,7 @@ fun ThreatItem(threat: ThreatAlert) {
                     style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
                 )
                 Text(
-                    threat.threatType.displayName,
+                    "${threat.blockReason.displayName} • ${threat.threatType.displayName}",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
@@ -1032,11 +1456,11 @@ fun CallRecordItem(call: CallRecord) {
             ) {
                 Text(
                     when (call.status) {
-                        CallStatus.BLOCKED -> "⛔"
-                        CallStatus.ALLOWED -> "📞"
-                        CallStatus.MISSED -> "❌"
+                        CallStatus.BLOCKED -> "БЛОК"
+                        CallStatus.ALLOWED -> "ОК"
+                        CallStatus.MISSED -> "НЕТ"
                     },
-                    style = MaterialTheme.typography.bodyLarge
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
                 )
             }
 
@@ -1052,6 +1476,13 @@ fun CallRecordItem(call: CallRecord) {
                     call.contactName ?: "Неизвестный номер",
                     style = MaterialTheme.typography.bodySmall
                 )
+                call.blockReason?.let { reason ->
+                    Text(
+                        "Причина: ${reason.displayName}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
             }
 
             Column(
@@ -1082,83 +1513,81 @@ fun SystemInfoSection() {
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Text(
                 "Системная информация",
                 style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
             )
 
-            // Первая строка с двумя элементами
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.spacedBy(24.dp)
             ) {
-                InfoItem(
-                    title = "База данных",
-                    value = "Обновлена сегодня",
-                    icon = "💾",
-                    modifier = Modifier.weight(1f)
-                )
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text("БАЗА ДАННЫХ", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                    Text(
+                        "Обновлена",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
+                    )
+                    Text(
+                        "сегодня",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
-                Spacer(modifier = Modifier.width(16.dp))
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text("ВЕРСИЯ", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                    Text(
+                        "2.1.4",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
+                    )
+                    Text(
+                        "версия",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
-                InfoItem(
-                    title = "Версия",
-                    value = "2.1.4",
-                    icon = "🔢",
-                    modifier = Modifier.weight(1f)
-                )
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text("АНАЛИЗОВ", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                    Text(
+                        "1,247",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
+                    )
+                    Text(
+                        "анализов",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text("БЕЗ СБОЕВ", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                    Text(
+                        "30 дней",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
+                    )
+                    Text(
+                        "без сбоев",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-
-            // Вторая строка с двумя элементами
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                InfoItem(
-                    title = "Анализов",
-                    value = "1,247",
-                    icon = "📊",
-                    modifier = Modifier.weight(1f)
-                )
-
-                Spacer(modifier = Modifier.width(16.dp))
-
-                InfoItem(
-                    title = "Без сбоев",
-                    value = "30 дней",
-                    icon = "✅",
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun InfoItem(
-    modifier: Modifier = Modifier,
-    title: String,
-    value: String,
-    icon: String
-) {
-    Row(
-        modifier = modifier,
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Text(icon, style = MaterialTheme.typography.bodyLarge)
-        Column {
-            Text(
-                title,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                value,
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
-            )
         }
     }
 }
